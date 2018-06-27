@@ -1,0 +1,5 @@
+debug.h log.c log.c  		日志打印服务模块
+task_mqtt.c task_mqtt.h 	mqtt模块
+main.c  			程序入口
+
+linux 平台安装mosquitto及相关库,可用gcc或交叉编译生成可执行文件
