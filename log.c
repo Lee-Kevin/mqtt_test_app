@@ -1,236 +1,221 @@
-#include <errno.h>
-#include <string.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <pthread.h>
-#include <semaphore.h>
-#include <stdarg.h>
+/* Copyright (c) 2012 Wayne Tran <wayne@tran.io>
+ * License: MIT
+ */
+
 #include "log.h"
+#include <syslog.h>
+#include <stdarg.h>
 
-#define THREAD_NAME "log"
+int debugflag = 0;   // 添加是否使能debug功能
 
-typedef struct anna_log_buffer anna_log_buffer;
-struct anna_log_buffer {
-	size_t allocated;
-	anna_log_buffer *next;
-	/* str is grown by allocating beyond the struct */
-	char str[1];
-};
+typedef struct {
+	const char *domain;
+	int fd;
+	DWORD flags;
+} Logger;
 
-#define INITIAL_BUFSZ		2000
+static Logger logger = {"",-1,0};
 
-static bool anna_log_console = true;
-static char *anna_log_filepath = NULL;
-static FILE *anna_log_file = NULL;
+bool logInit(const char *domain){
+	if(!domain)
+		return false;
 
-static int initialized = 0;
-static int stopping = 0;
-static int poolsz = 0;
-static int maxpoolsz = 32;
-/* Buffers over this size will be freed */
-static size_t maxbuffersz = 8000;
+	logger.domain = domain;
+	logSetFlags(LOGFLAG_STDOUT|LOGFLAG_INFO|LOGFLAG_ERROR|
+				LOGFLAG_DEBUG|LOGFLAG_TRACE|LOGFLAG_WARN);
 
-static pthread_cond_t cond=PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-static pthread_t printthread;
+	return true;
 
-static anna_log_buffer *printhead = NULL;
-static anna_log_buffer *printtail = NULL;
-static anna_log_buffer *bufferpool = NULL;
-
-
-bool anna_log_is_stdout_enabled(void) {
-	return anna_log_console;
 }
 
-bool anna_log_is_logfile_enabled(void) {
-	return anna_log_file != NULL;
-}
-
-char *anna_log_get_logfile_path(void) {
-	return anna_log_filepath;
-}
-
-
-static void anna_log_freebuffers(anna_log_buffer **list) {
-	anna_log_buffer *b, *head = *list;
-
-	while (head) {
-		b = head;
-		head = b->next;
-		free(b);
+bool logClose(){
+	closelog();
+	if(logger.fd != -1 && close(logger.fd)){
+		logError("Could not close log file.");
+		return false;
 	}
-	*list = NULL;
+	logger.fd = -1;
+	return true;
 }
 
-static anna_log_buffer *anna_log_getbuf(void) {
-	anna_log_buffer *b;
+void logSetFlags(DWORD logflags){
+	logClose();
+	logger.flags = logflags;
 
-	pthread_mutex_lock(&lock);
-	b = bufferpool;
-	if (b) {
-		bufferpool = b->next;
-		b->next = NULL;
-	} else {
-		poolsz++;
-	}
-	pthread_mutex_unlock(&lock);
-	if (b == NULL) {
-		b = malloc(INITIAL_BUFSZ + sizeof(*b));
-		b->allocated = INITIAL_BUFSZ;
-		b->next = NULL;
-	}
-	return b;
-}
+	if(logger.domain && strlen(logger.domain) > 0){
+		if((logger.flags & LOGFLAG_FILE) == LOGFLAG_FILE){
+			int openFlags;
+			mode_t filePerms;
+			openFlags = O_CREAT | O_WRONLY | O_APPEND;
+			filePerms = S_IRUSR | S_IWUSR;
+			logger.fd = open(logger.domain, openFlags, filePerms);
 
-static void *anna_log_thread(void *ctx) {
-	anna_log_buffer *head, *b, *tofree = NULL;
-
-	while (!stopping) {
-		pthread_mutex_lock(&lock);
-		if (!printhead) {
-			pthread_cond_wait(&cond, &lock);
-		}
-		head = printhead;
-		printhead = printtail = NULL;
-		pthread_mutex_unlock(&lock);
-
-		if (head) {
-			for (b = head; b; b = b->next) {
-				if(anna_log_console)
-					fputs(b->str, stdout);
-				if(anna_log_file)
-					fputs(b->str, anna_log_file);
+			if (logger.fd == -1){
+				logError("Could not open file for logging.");
 			}
-			pthread_mutex_lock(&lock);
-			while (head) {
-				b = head;
-				head = b->next;
-				if (poolsz >= maxpoolsz || b->allocated > maxbuffersz) {
-					b->next = tofree;
-					tofree = b;
-					poolsz--;
-				} else {
-					b->next = bufferpool;
-					bufferpool = b;
-				}
-			}
-			pthread_mutex_unlock(&lock);
-			if(anna_log_console)
-				fflush(stdout);
-			if(anna_log_file)
-				fflush(anna_log_file);
-			anna_log_freebuffers(&tofree);
+		}
+
+		if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+			/*logs PID, connects immediately and are generic user level messages*/
+			openlog (logger.domain, LOG_PID | LOG_NDELAY, LOG_USER);
 		}
 	}
-	/* print any remaining messages, stdout flushed on exit */
-	for (b = printhead; b; b = b->next) {
-		if(anna_log_console)
-			fputs(b->str, stdout);
-		if(anna_log_file)
-			fputs(b->str, anna_log_file);
-	}
-	if(anna_log_console)
-		fflush(stdout);
-	if(anna_log_file)
-		fflush(anna_log_file);
-	anna_log_freebuffers(&printhead);
-	anna_log_freebuffers(&bufferpool);
-	pthread_mutex_destroy(&lock);
-	pthread_cond_destroy(&cond);
 
-	if(anna_log_file)
-		fclose(anna_log_file);
-	anna_log_file = NULL;
-	free(anna_log_filepath);
-	anna_log_filepath = NULL;
-
-	return NULL;
 }
 
-void anna_vprintf(const char *format, ...) {
-	int len;
-	va_list ap, ap2;
-	anna_log_buffer *b = anna_log_getbuf();
-
-	va_start(ap, format);
-	va_copy(ap2, ap);
-	/* first try */
-	len = vsnprintf(b->str, b->allocated, format, ap);
-	va_end(ap);
-	if (len >= (int) b->allocated) {
-		/* buffer wasn't big enough */
-		b = realloc(b, len + 1 + sizeof(*b));
-		b->allocated = len + 1;
-		vsnprintf(b->str, b->allocated, format, ap2);
-	}
-	va_end(ap2);
-
-	pthread_mutex_lock(&lock);
-	if (!printhead) {
-		printhead = printtail = b;
-	} else {
-		printtail->next = b;
-		printtail = b;
-	}
-	pthread_cond_signal(&cond);
-	pthread_mutex_unlock(&lock);
+DWORD logGetFlags(){
+	return logger.flags;
 }
 
-int anna_log_init(bool daemon, bool console, const char *logfile) {
-	if (initialized) {
-		return 0;
-	}
-	initialized=1;
-	//pthread_mutex_init(&lock);
-	//pthread_cond_init(&cond);
-	if(console) {
-		/* Set stdout to block buffering, see BUFSIZ in stdio.h */
-		setvbuf(stdout, NULL, _IOFBF, 0);
-	}
-	anna_log_console = console;
-	if(logfile != NULL) {
-		/* Open a log file for writing (and append) */
-		anna_log_file = fopen(logfile, "awt");
-		if(anna_log_file == NULL) {
-			printf("Error opening log file %s: %s\n", logfile, strerror(errno));
-			return -1;
-		}
-		anna_log_filepath = strdup(logfile);
-	}
-	if(!anna_log_console && logfile == NULL) {
-		printf("WARNING: logging completely disabled!\n");
-		printf("         (no stdout and no logfile, this may not be what you want...)\n");
-	}
-	if(daemon) {
-		/* Replace the standard file descriptors */
-		if (freopen("/dev/null", "r", stdin) == NULL) {
-			printf("Error replacing stdin with /dev/null\n");
-			return -1;
-		}
-		if (freopen("/dev/null", "w", stdout) == NULL) {
-			printf("Error replacing stdout with /dev/null\n");
-			return -1;
-		}
-		if (freopen("/dev/null", "w", stderr) == NULL) {
-			printf("Error replacing stderr with /dev/null\n");
-			return -1;
-		}
-	}
-	//printthread = g_thread_new(THREAD_NAME, &anna_log_thread, NULL);
-	int err = pthread_create(&printthread,NULL,anna_log_thread,NULL);
-	if(err != 0){
-		printf("Error create thread\n");
-	}
-	return 0;
+DWORD logRemoveFlags(DWORD mask){
+	DWORD flags = logger.flags & ~mask;
+	logSetFlags(flags);
+	return flags;
 }
 
-void anna_log_destroy(void) {
-	stopping=1;
-	pthread_mutex_lock(&lock);
-	/* Signal print thread to print any remaining message */
-	pthread_cond_signal(&cond);
-	pthread_mutex_unlock(&lock);
-	pthread_join(printthread,NULL);
+DWORD logAddFlags(DWORD mask){
+	DWORD flags = logger.flags | mask;
+	logSetFlags(flags);
+	return flags;
 }
 
+char * currentTimeString(){
+	time_t rawtime;
+	struct tm * timeinfo;
+	char *buffer = (char*) malloc(sizeof(char) * 81);
+	time ( &rawtime );
+	timeinfo = localtime ( &rawtime );
+
+	strftime (buffer,80,"%c",timeinfo);
+	return buffer;
+
+}
+
+
+void logMsg(const char *format, va_list args, bool isError){
+	char timeformat[MAXLENGTH];
+	char buffer[MAXLENGTH];
+	char * timeString = currentTimeString();
+
+
+	snprintf(timeformat,MAXLENGTH,"[%s] %s\n",timeString,format);
+	size_t bufferSize = vsnprintf(buffer, MAXLENGTH, timeformat, args);
+
+
+	/*If the STDERR flag is not set, we print all messages to STDOUT if that
+	 *flag is set.  Otherwise, we split up the error messages*/
+	if((logger.flags & LOGFLAG_STDERR) != LOGFLAG_STDERR){
+		if((logger.flags & LOGFLAG_STDOUT) == LOGFLAG_STDOUT){
+			printf("%s",buffer);
+			fflush(stdout);
+		}
+	}else{
+		if(!isError && (logger.flags & LOGFLAG_STDOUT) == LOGFLAG_STDOUT){
+			printf("%s",buffer);
+			fflush(stdout);
+		}
+
+		if(isError && (logger.flags & LOGFLAG_STDERR) == LOGFLAG_STDERR){
+			fprintf(stderr,"%s",buffer);
+			fflush(stderr);
+		}
+	}
+
+	/*Write out to a file if the flag is set*/
+	if((logger.flags & LOGFLAG_FILE) == LOGFLAG_FILE){
+		write(logger.fd,buffer,bufferSize);
+	}
+
+
+	free(timeString);
+}
+
+
+void logError(const char *format, ...){
+	if((logger.flags & LOGFLAG_ERROR) != LOGFLAG_ERROR)
+	    return;
+
+	va_list args;
+	va_start(args,format);
+	char buffer[MAXLENGTH];
+	if(snprintf(buffer,MAXLENGTH,"ERROR: %s",format)){
+
+		logMsg(buffer, args,true);
+
+	}
+	/*Write to syslog if flag is set*/
+	if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+		vsyslog(LOG_ERR,buffer,args);
+	}
+	va_end(args);
+}
+
+void logInfo(const char *format, ...){
+	if((logger.flags & LOGFLAG_INFO) != LOGFLAG_INFO)
+	    return;
+	va_list args;
+	va_start(args,format);
+
+	char buffer[MAXLENGTH];
+	if(snprintf(buffer,MAXLENGTH,"INFO: %s",format)){
+		logMsg(buffer, args, false);
+	}
+	/*Write to syslog if flag is set*/
+	if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+		vsyslog(LOG_INFO,buffer,args);
+	}
+	va_end(args);
+}
+
+void logDebug(const char *format, ...){
+	if((logger.flags & LOGFLAG_DEBUG) != LOGFLAG_DEBUG)
+	    return;
+	va_list args;
+	va_start(args,format);
+
+	char buffer[MAXLENGTH];
+	if(snprintf(buffer,MAXLENGTH,"DEBUG: %s",format)){
+		logMsg(buffer, args, false);
+	}
+
+	/*Write to syslog if flag is set*/
+	if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+		vsyslog(LOG_DEBUG,buffer,args);
+	}
+	va_end(args);
+}
+
+void logTrace(const char *format, ...){
+	if((logger.flags & LOGFLAG_TRACE) != LOGFLAG_TRACE)
+	    return;
+	va_list args;
+	va_start(args,format);
+
+	char buffer[MAXLENGTH];
+	if(snprintf(buffer,MAXLENGTH,"TRACE: %s",format)){
+		logMsg(buffer, args, false);
+	}
+	/*Write to syslog if flag is set*/
+	if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+		vsyslog(LOG_DEBUG,buffer,args);
+	}
+	va_end(args);
+}
+
+void logWarn(const char *format, ...){
+	if((logger.flags & LOGFLAG_WARN) != LOGFLAG_WARN)
+	    return;
+	va_list args;
+	va_start(args,format);
+
+	char buffer[MAXLENGTH];
+	if(snprintf(buffer,MAXLENGTH,"WARNING: %s",format)){
+		logMsg(buffer, args, true);
+	}
+
+	/*Write to syslog if flag is set*/
+	if((logger.flags & LOGFLAG_SYSLOG) == LOGFLAG_SYSLOG){
+		vsyslog(LOG_WARNING,buffer,args);
+	}
+	va_end(args);
+}
